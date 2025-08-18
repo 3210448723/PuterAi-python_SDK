@@ -411,11 +411,25 @@ def list_models():
     # 尝试从Puter API动态获取模型列表
     try:
         app.logger.debug("正在从Puter API获取模型列表...")
-        response = requests.get(PUTER_MODELS_URL, headers=headers, timeout=10)
+        response = requests.get(PUTER_MODELS_URL, headers=headers, timeout=30)
         if response.status_code == 200:
             models_data = response.json()
             for model in models_data.get("models", []):
-                data.append(model)
+                # 如果是字典类型对象，核对是否符合openai模型格式
+                if isinstance(model, dict):
+                    data.append({
+                        "id": model["id"] if "id" in model else model.get("name", ""),
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "puter",
+                    })
+                elif isinstance(model, str):
+                    data.append({
+                        "id": model,
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "puter",
+                    })
             app.logger.info(f"成功从Puter API获取到 {len(data)} 个模型")
             return jsonify({"object": "list", "data": data})
     except Exception as e:
