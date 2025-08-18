@@ -1,127 +1,173 @@
+# PuterAI OpenAI Proxy
 
-# PuterAi-python_SDK
+一个将[Puter.js AI API](https://docs.puter.com/AI/)包装成OpenAI Python SDK兼容接口的代理服务器。免费访问400+种AI模型。
 
-PuterAi Python SDK provides a simple way to interact with the Puter AI API for chatbot interactions and text-to-speech (TTS) generation. This SDK allows you to integrate chatbot and TTS functionalities into your own applications.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-## Features
+## ✨ 功能特性
 
-- **Chatbot Interaction**: Communicate with a chatbot powered by Puter AI.
-- **Text-to-Speech (TTS)**: Convert any text into audio using AWS Polly TTS service.
+- **🤖 聊天对话**: 支持GPT-4、Claude、Gemini等400+模型
+- **🖼️ 图像生成**: DALL-E兼容API
+- **🔊 文本转语音**: 多语言TTS合成
+- **👁️ 图像理解**: 视觉理解和OCR
+- **⚡ 流式传输**: 实时响应支持
+- **🔧 函数调用**: Tool Calling支持
 
-## Project Structure
+## 🚀 快速开始
 
-The project consists of multiple components:
-
-- **`login.py`**: Script to handle user login and retrieve an API token for further requests.
-- **`cli.py`**: Command-line interface that allows users to interact with the Puter chatbot or generate TTS output.
-- **`server.py`**: A Flask-based API server that exposes endpoints for chatbot and TTS functionalities.
-- **`example.html`**: A simple HTML front-end to interact with the chatbot and generate TTS via a browser.
-
-## Requirements
-
-To run this project, you need to install the following dependencies:
-
-- `requests`: To handle HTTP requests.
-- `flask`: For the API server.
-- `flask_cors`: For handling Cross-Origin Resource Sharing (CORS).
-- `dotenv`: To load environment variables from a .env file.
-
-You can install the required dependencies with:
-
+### 1. 安装依赖
 ```bash
+git clone https://github.com/3210448723/PuterAi-python_SDK.git
+cd PuterAi-python_SDK
 pip install -r requirements.txt
 ```
 
-## Setup Instructions
-
-1. **Clone the Repository**
-
+### 2. 配置API密钥
 ```bash
-git clone https://github.com/mowhn/PuterAi-python_SDK.git
-cd puterAi-python_SDK
+# 环境变量方式
+export API_TOKEN="your_puter_api_token"
+
+# 或创建.env文件
+echo "API_TOKEN=your_puter_api_token" > .env
 ```
 
-2. **Setup .env File in Both CLI and API Folders**
-
-Create a `.env` file in both the `cli` and `API` directories and include your API_TOKEN:
-
-```env
-API_TOKEN=your_api_token_here
+### 3. 启动服务器
+```bash
+python API/openai_server.py
+# 或使用启动脚本: ./start.sh
 ```
 
-3. **Get the API Token**
+### 4. 使用示例
+```python
+import openai
 
-To quickly obtain your `API_TOKEN`, you must first run `login.py` to log in and retrieve the token:
+client = openai.OpenAI(
+    api_key="your_puter_api_token",
+    base_url="http://localhost:9595/v1"
+)
 
-- Run `login.py`:
+# 聊天对话
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)
+```
 
-  ```bash
-  cd cli
-  python login.py
-  ```
+更多示例请查看 `examples/` 目录。
 
-  This will prompt you for your username and password, and if the login is successful, it will output the `API_TOKEN`. You can copy this token and paste it into the `.env` file in both the `cli` and `API` folders.
+## 📋 支持的API
 
-  **Note**: If you don't have a Puter AI account, you can sign up at <a href="https://puter.com/?r=J1YOKLC5" target="_blank">
-  <img src="https://img.shields.io/badge/Sign%20Up%20for%20PuterAI-Click%20Here-brightgreen" alt="Sign Up for PuterAI" />
-</a>
+| API端点 | 功能 | 兼容性 |
+|---------|------|--------|
+| `/v1/chat/completions` | 聊天对话、图像理解、函数调用 | ✅ OpenAI ChatGPT |
+| `/v1/images/generations` | 图像生成 | ✅ OpenAI DALL-E |
+| `/v1/audio/speech` | 文本转语音 | ✅ OpenAI TTS |
+| `/v1/models` | 模型列表 | ✅ OpenAI Models |
+| `/health` | 健康检查 | - |
 
-4. **Running the Project**
+## 🔧 配置选项
 
-- Run the API Server:
+### 环境变量
+```bash
+API_TOKEN=your_puter_api_token    # Puter API密钥（必需）
+SERVER_HOST=0.0.0.0               # 服务器主机（默认0.0.0.0）
+SERVER_PORT=9595                  # 服务器端口（默认9595）
+DEBUG=true                        # 调试模式（默认false）
+```
 
-  ```bash
-  cd API
-  python server.py
-  ```
+### 请求头认证
+```bash
+curl -X POST http://localhost:9595/v1/chat/completions \
+  -H "Authorization: Bearer your_puter_api_token" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-  This will start the Flask API server on `http://localhost:5000`.
+## 📁 项目结构
 
-- Use the Command-Line Interface (CLI):
+```
+PuterAi-python_SDK/
+├── API/
+│   └── openai_server.py         # 主服务器文件
+├── examples/
+│   ├── basic_chat.py            # 基础聊天示例
+│   ├── image_generation.py      # 图像生成示例
+│   ├── text_to_speech.py        # 语音合成示例
+│   └── vision_api.py            # 图像理解示例
+├── tests/
+│   └── test_api.py              # API测试
+├── requirements.txt             # 依赖包
+├── .env.example                 # 环境变量示例
+├── .gitignore                  # Git忽略文件
+├── start.sh                    # 启动脚本
+├── LICENSE                     # MIT许可证
+└── README.md                   # 项目说明
+```
 
-  To interact with the chatbot or generate TTS from the command line, run:
+## 🛠️ 开发指南
 
-  ```bash
-  cd cli
-  python cli.py
-  ```
+### 本地开发
+```bash
+# 创建虚拟环境
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-5. **Front-End Example**
+# 安装依赖
+pip install -r requirements.txt
 
-Open the `example.html` file in a browser to interact with the Puter chatbot and generate TTS:
+# 运行测试
+python tests/test_api.py
 
-- **Chat with the Bot**: Enter a message and receive a response from the bot.
-- **Generate TTS**: Enter text to convert into speech, and play the generated audio.
+# 启动开发服务器
+python API/openai_server.py
+```
 
-## Endpoints
+### 生产部署
+```bash
+# 使用Gunicorn
+pip install gunicorn
+gunicorn -w 4 -b 0.0.0.0:9595 API.openai_server:app
+```
 
-The Flask API exposes the following endpoints:
+## 🛠️ 故障排除
 
-- **POST `/chat`**: Accepts a JSON object with a `message` field and returns a bot response.
+### 常见问题
 
-  Example request:
+1. **连接问题**: 检查服务器是否运行 `curl http://localhost:9595/health`
+2. **API密钥错误**: 验证.env文件中的API_TOKEN设置
+3. **模型不可用**: 访问 `/v1/models` 端点查看可用模型
+4. **调试模式**: 启动时添加 `--debug` 参数查看详细日志
 
-  ```json
-  {
-    "message": "Hello, bot!"
-  }
-  ```
+## 🤝 贡献指南
 
-- **POST `/tts`**: Accepts a JSON object with a `text` field and returns the corresponding TTS audio.
+欢迎提交Issue和Pull Request！
 
-  Example request:
+1. Fork本项目
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建Pull Request
 
-  ```json
-  {
-    "text": "Hello, this is a test."
-  }
-  ```
+## 📄 许可证
 
+本项目采用 [MIT License](LICENSE) 许可证。
 
-## License
+## 🙏 致谢
 
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/mowhn/PuterAi-python_SDK/blob/main/LICENSE) file for details.
+- [Puter.js](https://docs.puter.com/) - 提供强大的AI API后端
+- [OpenAI](https://openai.com/) - 提供标准的API接口规范
+- 所有贡献者和使用者
 
 ---
 
-Enjoy building with Puter!
+<div align="center">
+
+**⭐ 如果这个项目对你有帮助，请给个星标支持！⭐**
+
+[🏠 项目主页](https://github.com/3210448723/PuterAi-python_SDK) | 
+[📖 API文档](https://docs.puter.com/AI/) | 
+[🐛 问题反馈](https://github.com/3210448723/PuterAi-python_SDK/issues)
+
+</div>
