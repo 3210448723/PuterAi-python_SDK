@@ -387,6 +387,7 @@ def list_models():
     
     首先尝试从Puter API动态获取最新模型列表，
     如果失败则使用内置的静态模型列表作为回退。
+    todo: 可能包含不可用的模型，如：claude-3-haiku-20240307、arcee_ai/arcee-spotlight、meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo等，建议选择热门模型使用
     
     Returns:
         JSON: OpenAI格式的模型列表响应
@@ -553,6 +554,9 @@ def chat_completions():
         "args": args,
         "test_mode": False,  # 不启用测试模式，确保计费和token使用
     }
+    # 当model为OpenAI兼容模型时使用（没有冒号），如果是`openrouter:moonshotai/kimi-k2:free`等其他模型，则使用对应的driver=openrouter
+    if ":" in model:
+        payload["driver"] = model.split(":")[0]  # 提取冒号前的部分作为driver
 
     # Token usage estimation (best-effort)
     try:
