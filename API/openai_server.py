@@ -150,6 +150,9 @@ def estimate_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     Note:
         优先使用tiktoken库进行精确估算，如果不可用则使用简单的字符数除以4的方法
     """
+    # 新增：确保 text 为字符串
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
     try:
         import tiktoken
         try:
