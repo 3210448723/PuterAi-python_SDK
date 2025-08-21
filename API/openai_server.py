@@ -57,7 +57,7 @@ def setup_logging():
         backupCount=5  # 保留5个备份文件
     )
     file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s (%(pathname)s:%(lineno)d)'
+        '%(asctime)s [%(levelname)s] [%(filename)s:%(funcName)s:%(lineno)d] %(message)s'
     ))
     file_handler.setLevel(logging.INFO)
 
@@ -68,6 +68,9 @@ def setup_logging():
     ))
     console_handler.setLevel(logging.INFO)
 
+    # 清除Flask默认的处理器，避免重复日志
+    app.logger.handlers.clear()
+    
     # 将处理器添加到应用日志器
     app.logger.addHandler(file_handler)
     app.logger.addHandler(console_handler)
@@ -761,8 +764,43 @@ def chat_completions():
         return jsonify({"error": {"message": "Upstream returned error", "details": data}}), 502
 
     message_obj = data.get("result", {}).get("message", {})
-    assistant_text = message_obj.get("content") or ""
+    raw_content = message_obj.get("content") or ""
     tool_calls = message_obj.get("tool_calls")
+    
+    # 处理content字段：支持字符串和字典格式
+    assistant_text = ""
+    if isinstance(raw_content, str):
+        # 直接是字符串格式
+        assistant_text = raw_content
+        app.logger.debug("Content是字符串格式")
+    elif isinstance(raw_content, dict):
+        # 字典格式，提取text字段
+        if "text" in raw_content:
+            assistant_text = raw_content.get("text", "")
+            app.logger.debug(f"Content是字典格式，提取text字段: {raw_content}")
+        else:
+            # 如果没有text字段，将整个字典转为JSON字符串
+            assistant_text = json.dumps(raw_content, ensure_ascii=False)
+            app.logger.warning(f"Content是字典格式但没有text字段: {raw_content}")
+    elif isinstance(raw_content, list):
+        # 列表格式，处理多个内容块
+        text_parts = []
+        for item in raw_content:
+            if isinstance(item, dict) and "text" in item:
+                text_parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                text_parts.append(item)
+            else:
+                app.logger.warning(f"Content列表中的未知格式项: {item}")
+        assistant_text = "".join(text_parts)
+        app.logger.debug(f"Content是列表格式，提取了{len(text_parts)}个文本块")
+    else:
+        assistant_text = str(raw_content) if raw_content is not None else ""
+        app.logger.warning(f"Content格式未知，转为字符串: {type(raw_content)}")
+    
+    # 确保assistant_text是字符串
+    if not isinstance(assistant_text, str):
+        assistant_text = str(assistant_text)
 
     app.logger.info(f"Response received, length: {len(assistant_text)} chars")
 
