@@ -27,6 +27,9 @@ import base64
 import threading
 import subprocess
 import sys
+import asyncio
+from threading import Semaphore
+from functools import wraps
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -140,7 +143,54 @@ AUDIO_CONTENT_TYPE_MAPPING = {
 
 app.logger.info("常量配置加载完成")
 
+# ====== 全局变量部分 ======
+
+# 自动注册锁，防止同时启动多个注册进程
+_auto_register_lock = threading.Lock()
+_auto_register_in_progress = False
+_auto_register_disabled = False  # 标记自动注册是否被禁用（IP被限制时）
+
+# 并发控制：限制同时处理的请求数量为10
+MAX_CONCURRENT_REQUESTS = 10
+request_semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+
 # ====== 工具函数部分 ======
+
+def limit_concurrency(max_requests=MAX_CONCURRENT_REQUESTS):
+    """
+    限制并发请求数量的装饰器
+    
+    Args:
+        max_requests: 最大并发请求数量
+        
+    Returns:
+        装饰器函数
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 尝试获取信号量，如果无法获取则等待
+            if not request_semaphore.acquire(blocking=True, timeout=30):
+                app.logger.warning(f"请求超时：并发数已达上限 {max_requests}")
+                return jsonify({
+                    "error": {
+                        "message": f"服务器繁忙，当前并发请求数已达上限 {max_requests}，请稍后重试",
+                        "type": "rate_limit_exceeded",
+                        "code": "concurrent_limit_exceeded"
+                    }
+                }), 429
+            
+            try:
+                app.logger.debug(f"请求开始处理，当前并发数: {max_requests - request_semaphore._value}")
+                return func(*args, **kwargs)
+            finally:
+                # 确保在函数执行完成后释放信号量
+                request_semaphore.release()
+                app.logger.debug(f"请求处理完成，当前并发数: {max_requests - request_semaphore._value}")
+        
+        return wrapper
+    return decorator
+
 
 def estimate_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     """
@@ -210,51 +260,112 @@ def is_usage_limited_error(error_data):
 def auto_register_token():
     """
     在后台异步执行token注册
-    """
-    def register_in_background():
-        try:
-            app.logger.info("🔄 检测到token用量不足，开始自动重新注册...")
-            
-            # 获取当前脚本所在目录
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            parent_dir = os.path.dirname(current_dir)  # 上级目录
-            register_script = os.path.join(parent_dir, 'register.py')
-            
-            # 检查注册脚本是否存在
-            if not os.path.exists(register_script):
-                app.logger.error(f"❌ 注册脚本不存在: {register_script}")
-                return
-            
-            # 在新进程中运行注册脚本
-            app.logger.info(f"🚀 正在执行注册脚本: {register_script}")
-            result = subprocess.run(
-                [sys.executable, register_script],
-                cwd=parent_dir,
-                capture_output=True,
-                text=True,
-                timeout=120  # 2分钟超时
-            )
-            
-            if result.returncode == 0:
-                app.logger.info("✅ 自动注册成功完成")
-                app.logger.info(f"注册输出: {result.stdout}")
-                
-                # 重新加载环境变量
-                load_dotenv(override=True)
-                app.logger.info("🔄 已重新加载环境变量")
-            else:
-                app.logger.error(f"❌ 自动注册失败，返回码: {result.returncode}")
-                app.logger.error(f"错误输出: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            app.logger.error("❌ 自动注册超时")
-        except Exception as e:
-            app.logger.error(f"❌ 自动注册过程中出错: {str(e)}")
     
-    # 在后台线程中执行注册
-    thread = threading.Thread(target=register_in_background, daemon=True)
-    thread.start()
-    app.logger.info("🔄 已启动后台注册线程")
+    使用全局锁机制防止同时启动多个注册进程。
+    如果已有注册进程在运行，则跳过本次注册请求。
+    如果检测到IP被限制注册，则禁用自动注册功能。
+    """
+    global _auto_register_in_progress, _auto_register_disabled
+    
+    # 检查自动注册是否已被禁用
+    if _auto_register_disabled:
+        app.logger.warning("🚫 自动注册功能已被禁用（IP被限制注册），跳过注册请求")
+        return
+    
+    # 使用非阻塞锁检查是否已有注册进程在运行
+    if not _auto_register_lock.acquire(blocking=False):
+        app.logger.info("🔄 已有自动注册进程在运行，跳过本次注册请求")
+        return
+    
+    try:
+        if _auto_register_in_progress:
+            app.logger.info("🔄 已有自动注册进程在运行，跳过本次注册请求")
+            return
+        
+        # 标记注册进程开始
+        _auto_register_in_progress = True
+        app.logger.info("🔄 检测到token用量不足，开始自动重新注册...")
+        
+        def register_in_background():
+            global _auto_register_in_progress, _auto_register_disabled
+            try:
+                # 获取当前脚本所在目录
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                parent_dir = os.path.dirname(current_dir)  # 上级目录
+                register_script = os.path.join(parent_dir, 'register.py')
+                
+                # 检查注册脚本是否存在
+                if not os.path.exists(register_script):
+                    app.logger.error(f"❌ 注册脚本不存在: {register_script}")
+                    return
+                
+                # 在新进程中运行注册脚本
+                app.logger.info(f"🚀 正在执行注册脚本: {register_script}")
+                result = subprocess.run(
+                    [sys.executable, register_script],
+                    cwd=parent_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=120  # 2分钟超时
+                )
+                
+                if result.returncode == 0:
+                    app.logger.info("✅ 自动注册成功完成")
+                    app.logger.info(f"注册输出: {result.stdout}")
+                    
+                    # 重新加载环境变量
+                    load_dotenv(override=True)
+                    app.logger.info("🔄 已重新加载环境变量")
+                else:
+                    app.logger.error(f"❌ 自动注册失败，返回码: {result.returncode}")
+                    app.logger.error(f"错误输出: {result.stderr}")
+                    
+                    # 检查是否是注册被限制（register.py返回-1）
+                    if result.returncode == 1:  # register.py中return -1会导致进程退出码为1
+                        app.logger.warning("🚫 检测到IP被限制注册，禁用自动注册功能")
+                        _auto_register_disabled = True
+                        app.logger.info("💡 提示：请更换网络环境或IP地址后手动运行register.py重新注册")
+                    
+            except subprocess.TimeoutExpired:
+                app.logger.error("❌ 自动注册超时")
+            except Exception as e:
+                app.logger.error(f"❌ 自动注册过程中出错: {str(e)}")
+            finally:
+                # 注册完成，重置状态
+                _auto_register_in_progress = False
+                app.logger.info("🔄 自动注册进程已结束")
+        
+        # 在后台线程中执行注册
+        thread = threading.Thread(target=register_in_background, daemon=True)
+        thread.start()
+        app.logger.info("🔄 已启动后台注册线程")
+        
+    finally:
+        # 释放锁
+        _auto_register_lock.release()
+
+
+def enable_auto_register():
+    """
+    重新启用自动注册功能
+    
+    当用户更换网络环境或IP地址后，可以调用此函数重新启用自动注册功能
+    """
+    global _auto_register_disabled
+    
+    # 启用自动注册功能
+    _auto_register_disabled = False
+    app.logger.info("🔄 自动注册功能已重新启用")
+
+
+def is_auto_register_disabled():
+    """
+    检查自动注册功能是否被禁用
+    
+    Returns:
+        bool: 如果自动注册被禁用返回True
+    """
+    return _auto_register_disabled
 
 
 def ensure_env_file_exists():
@@ -491,6 +602,7 @@ app.logger.info("工具函数初始化完成")
 # ====== API端点实现部分 ======
 
 @app.route("/v1/models", methods=["GET"])
+@limit_concurrency()
 def list_models():
     """
     获取可用模型列表 (兼容OpenAI Models API)
@@ -560,6 +672,7 @@ def list_models():
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
+@limit_concurrency()
 def chat_completions():
     """
     聊天完成API (兼容OpenAI Chat Completions API)
@@ -880,7 +993,7 @@ def chat_completions():
                 }
             }), 429  # 使用429状态码表示速率限制
         
-        return jsonify({"error": {"message": "Upstream returned error", "details": data}}), 502
+        return jsonify({"error": {"message": "Upstream返回错误", "details": data}}), 502
 
     message_obj = data.get("result", {}).get("message", {})
     raw_content = message_obj.get("content") or ""
@@ -932,6 +1045,7 @@ def chat_completions():
 
 
 @app.route("/v1/images/generations", methods=["POST"])
+@limit_concurrency()
 def image_generation():
     """
     图像生成API (兼容OpenAI DALL-E API)
@@ -1062,6 +1176,7 @@ def image_generation():
 
 
 @app.route("/v1/audio/speech", methods=["POST"])
+@limit_concurrency()
 def text_to_speech():
     """
     文本转语音API (兼容OpenAI TTS API)
@@ -1202,6 +1317,96 @@ def health():
     })
 
 
+@app.route("/v1/stats", methods=["GET"])
+def get_stats():
+    """
+    获取服务器统计信息端点
+    
+    返回当前并发状态、可用资源等信息
+    
+    Returns:
+        JSON: 包含服务器统计信息的响应
+    """
+    current_concurrent = MAX_CONCURRENT_REQUESTS - request_semaphore._value
+    available_slots = request_semaphore._value
+    
+    app.logger.info(f"收到统计信息请求 - 当前并发: {current_concurrent}/{MAX_CONCURRENT_REQUESTS}")
+    
+    return jsonify({
+        "status": "ok",
+        "timestamp": int(time.time()),
+        "concurrency": {
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "current_concurrent_requests": current_concurrent,
+            "available_slots": available_slots,
+            "usage_percentage": round((current_concurrent / MAX_CONCURRENT_REQUESTS) * 100, 2)
+        },
+        "service_info": {
+            "name": "PuterAI OpenAI Proxy",
+            "version": "1.0.0"
+        }
+    })
+
+
+@app.route("/v1/admin/auto-register/enable", methods=["POST"])
+@limit_concurrency()
+def enable_auto_register_endpoint():
+    """
+    重新启用自动注册功能的管理端点
+    
+    当用户更换网络环境或IP地址后，可以调用此端点重新启用自动注册功能
+    
+    Returns:
+        JSON: 操作结果
+    """
+    # 验证API密钥
+    api_key = get_effective_api_key()
+    if not api_key:
+        app.logger.error("未提供有效的API密钥")
+        return jsonify({
+            "error": {
+                "message": "未提供有效的API密钥。请在Authorization头中提供或设置API_TOKEN环境变量",
+                "type": "invalid_request_error"
+            }
+        }), 401
+    
+    enable_auto_register()
+    
+    return jsonify({
+        "message": "自动注册功能已重新启用",
+        "auto_register_enabled": True,
+        "timestamp": int(time.time())
+    })
+
+
+@app.route("/v1/admin/auto-register/status", methods=["GET"])
+@limit_concurrency()
+def auto_register_status():
+    """
+    查看自动注册功能状态
+    
+    Returns:
+        JSON: 自动注册功能的状态信息
+    """
+    # 验证API密钥
+    api_key = get_effective_api_key()
+    if not api_key:
+        app.logger.error("未提供有效的API密钥")
+        return jsonify({
+            "error": {
+                "message": "未提供有效的API密钥。请在Authorization头中提供或设置API_TOKEN环境变量",
+                "type": "invalid_request_error"
+            }
+        }), 401
+    
+    return jsonify({
+        "auto_register_disabled": is_auto_register_disabled(),
+        "auto_register_in_progress": _auto_register_in_progress,
+        "message": "禁用原因：IP被限制注册" if is_auto_register_disabled() else "自动注册功能正常",
+        "timestamp": int(time.time())
+    })
+
+
 # ====== 服务器启动部分 ======
 
 if __name__ == "__main__":
@@ -1216,7 +1421,11 @@ if __name__ == "__main__":
     app.logger.info(f"🔑 API密钥配置:")
     app.logger.info(f"   方式1: Authorization头 (推荐生产环境)")
     app.logger.info(f"   方式2: 环境变量API_TOKEN (推荐开发环境)")
+    app.logger.info(f"⚡ 并发控制: 最大同时处理 {MAX_CONCURRENT_REQUESTS} 个请求")
+    app.logger.info(f"📊 监控端点: GET /v1/stats (查看实时并发状态)")
     app.logger.info(f"💡 自动注册: 检测到token用量不足时将自动重新注册")
+    app.logger.info(f"🛠️  管理端点: POST /v1/admin/auto-register/enable (重新启用自动注册)")
+    app.logger.info(f"📋 状态查看: GET /v1/admin/auto-register/status (查看自动注册状态)")
     app.logger.info("="*60)
     
     # 启动服务器 (禁用reloader以避免与debugpy冲突)

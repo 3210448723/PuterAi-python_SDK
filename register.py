@@ -22,6 +22,12 @@ async def get_signup_token():
                     # 先获取响应文本
                     response_text = await response.text()
                     print(f"响应内容: {response_text[:500]}...")  # 只打印前500字符
+
+                    # 如果响应是：You are not allowed to sign up
+                    # 说明该ip已被限制注册
+                    if "You are not allowed to sign up" in response_text:
+                        token = -1  # 设置为 -1 表示注册失败
+                        return
                     
                     # 如果状态码是 200-299，尝试解析 JSON
                     if 200 <= response.status < 300:
@@ -39,7 +45,7 @@ async def get_signup_token():
         page.on("response", handle_response)
         
         print("正在访问 https://puter.com/...")
-        await page.goto("https://puter.com/", wait_until="networkidle")
+        await page.goto("https://puter.com/", wait_until="networkidle", timeout=1000*120)  # 增加超时时间到120秒
         
         # 等待页面完全加载
         await asyncio.sleep(3)
@@ -51,10 +57,13 @@ async def get_signup_token():
         await browser.close()
         
         # 将 token 写入 .env 文件
-        if token:
+        if token and token != -1:
             with open('.env', 'w') as f:
                 f.write(f'API_TOKEN="{token}"\n')
             print(f"Token 已写入 .env 文件: {token}")
+        elif token == -1:
+            print("注册失败，未获取到有效的 token。请更换 IP 后重试。")
+            return -1
         else:
             print("未获取到 token")
             
@@ -62,4 +71,12 @@ async def get_signup_token():
 
 if __name__ == "__main__":
     token = asyncio.run(get_signup_token())
-    print("Token:", token)
+    if token and token != -1:
+        print("Token:", token)
+        exit(0)  # 成功退出
+    elif token == -1:
+        print("注册被限制，退出程序")
+        exit(1)  # 注册被限制，返回错误码1
+    else:
+        print("注册失败，未知错误")
+        exit(2)  # 其他错误，返回错误码2
