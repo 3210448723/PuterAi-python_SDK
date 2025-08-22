@@ -24,6 +24,9 @@ import uuid
 import logging
 import requests
 import base64
+import threading
+import subprocess
+import sys
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -172,6 +175,107 @@ def estimate_tokens(text: str, model: str = "gpt-4o-mini") -> int:
         token_count = max(1, int(len(text or "") / 4))
         app.logger.debug(f"使用字符数估算token数量: {token_count}")
         return token_count
+
+
+def is_usage_limited_error(error_data):
+    """
+    检测是否是token用量不足的错误
+    
+    Args:
+        error_data: 错误数据字典
+        
+    Returns:
+        bool: 如果是用量限制错误返回True
+    """
+    if not isinstance(error_data, dict):
+        return False
+    
+    # 检查错误类型和消息
+    error_info = error_data.get('error', {})
+    if isinstance(error_info, dict):
+        delegate = error_info.get('delegate', '')
+        message = error_info.get('message', '')
+        code = error_info.get('code', '')
+        
+        # 检测特定的用量限制错误
+        if (delegate == 'usage-limited-chat' or 
+            'usage-limited' in delegate or
+            'Permission denied' in message or
+            code == 'error_400_from_delegate'):
+            return True
+    
+    return False
+
+
+def auto_register_token():
+    """
+    在后台异步执行token注册
+    """
+    def register_in_background():
+        try:
+            app.logger.info("🔄 检测到token用量不足，开始自动重新注册...")
+            
+            # 获取当前脚本所在目录
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(current_dir)  # 上级目录
+            register_script = os.path.join(parent_dir, 'register.py')
+            
+            # 检查注册脚本是否存在
+            if not os.path.exists(register_script):
+                app.logger.error(f"❌ 注册脚本不存在: {register_script}")
+                return
+            
+            # 在新进程中运行注册脚本
+            app.logger.info(f"🚀 正在执行注册脚本: {register_script}")
+            result = subprocess.run(
+                [sys.executable, register_script],
+                cwd=parent_dir,
+                capture_output=True,
+                text=True,
+                timeout=120  # 2分钟超时
+            )
+            
+            if result.returncode == 0:
+                app.logger.info("✅ 自动注册成功完成")
+                app.logger.info(f"注册输出: {result.stdout}")
+                
+                # 重新加载环境变量
+                load_dotenv(override=True)
+                app.logger.info("🔄 已重新加载环境变量")
+            else:
+                app.logger.error(f"❌ 自动注册失败，返回码: {result.returncode}")
+                app.logger.error(f"错误输出: {result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            app.logger.error("❌ 自动注册超时")
+        except Exception as e:
+            app.logger.error(f"❌ 自动注册过程中出错: {str(e)}")
+    
+    # 在后台线程中执行注册
+    thread = threading.Thread(target=register_in_background, daemon=True)
+    thread.start()
+    app.logger.info("🔄 已启动后台注册线程")
+
+
+def ensure_env_file_exists():
+    """
+    确保.env文件存在，如果不存在则创建
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    env_file = os.path.join(parent_dir, '.env')
+    
+    if not os.path.exists(env_file):
+        app.logger.info("📝 .env文件不存在，正在创建...")
+        try:
+            with open(env_file, 'w') as f:
+                f.write('# PuterAI API Token\n')
+                f.write('API_TOKEN=""\n')
+            app.logger.info(f"✅ 已创建.env文件: {env_file}")
+        except Exception as e:
+            app.logger.error(f"❌ 创建.env文件失败: {str(e)}")
+    
+    return env_file
 
 
 def get_effective_api_key():
@@ -761,6 +865,21 @@ def chat_completions():
     data = resp.json()
     if not data.get("success"):
         app.logger.error(f"Upstream returned error: {data}")
+        
+        # 检测是否是token用量不足错误，如果是则自动重新注册
+        if is_usage_limited_error(data):
+            app.logger.warning("🚨 检测到token用量不足错误，正在自动重新注册...")
+            auto_register_token()
+            
+            return jsonify({
+                "error": {
+                    "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
+                    "type": "usage_limited_error",
+                    "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
+                    "auto_register": True
+                }
+            }), 429  # 使用429状态码表示速率限制
+        
         return jsonify({"error": {"message": "Upstream returned error", "details": data}}), 502
 
     message_obj = data.get("result", {}).get("message", {})
@@ -894,6 +1013,21 @@ def image_generation():
             data = resp.json()
             if not data.get("success"):
                 app.logger.error(f"图像生成上游服务返回错误: {data}")
+                
+                # 检测是否是token用量不足错误，如果是则自动重新注册
+                if is_usage_limited_error(data):
+                    app.logger.warning("🚨 图像生成检测到token用量不足错误，正在自动重新注册...")
+                    auto_register_token()
+                    
+                    return jsonify({
+                        "error": {
+                            "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
+                            "type": "usage_limited_error",
+                            "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
+                            "auto_register": True
+                        }
+                    }), 429
+                
                 return jsonify({"error": {"message": "图像生成失败", "details": data}}), 502
             
             # Puter API在result字段中返回base64图像数据
@@ -1013,6 +1147,26 @@ def text_to_speech():
 
     if not resp.ok:
         app.logger.error(f"TTS上游服务返回错误状态 {resp.status_code}: {resp.text}")
+        
+        # 尝试解析JSON错误响应，检查是否是token用量不足
+        try:
+            if resp.headers.get('content-type', '').startswith('application/json'):
+                error_data = resp.json()
+                if is_usage_limited_error(error_data):
+                    app.logger.warning("🚨 TTS检测到token用量不足错误，正在自动重新注册...")
+                    auto_register_token()
+                    
+                    return jsonify({
+                        "error": {
+                            "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
+                            "type": "usage_limited_error",
+                            "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
+                            "auto_register": True
+                        }
+                    }), 429
+        except:
+            pass  # 如果解析失败，继续使用原有错误处理
+        
         return jsonify({"error": {"message": f"上游服务状态码 {resp.status_code}", "details": resp.text}}), 502
 
     # Puter返回语音二进制数据，直接返回给客户端
@@ -1051,6 +1205,9 @@ def health():
 # ====== 服务器启动部分 ======
 
 if __name__ == "__main__":
+    # 确保.env文件存在
+    ensure_env_file_exists()
+    
     app.logger.info("="*60)
     app.logger.info("🚀 启动PuterAI OpenAI兼容代理服务器")
     app.logger.info("="*60)
@@ -1059,6 +1216,7 @@ if __name__ == "__main__":
     app.logger.info(f"🔑 API密钥配置:")
     app.logger.info(f"   方式1: Authorization头 (推荐生产环境)")
     app.logger.info(f"   方式2: 环境变量API_TOKEN (推荐开发环境)")
+    app.logger.info(f"💡 自动注册: 检测到token用量不足时将自动重新注册")
     app.logger.info("="*60)
     
     # 启动服务器 (禁用reloader以避免与debugpy冲突)
