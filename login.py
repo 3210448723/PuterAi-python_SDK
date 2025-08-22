@@ -1,4 +1,3 @@
-# todo: 用浏览器访问 https://puter.com/ 会自动生成一个 token：其中有一个请求 https://puter.com/signup 会自动创建一个临时账户
 import requests
 import json
 
