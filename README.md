@@ -7,12 +7,6 @@
 
 ## ✨ 功能特性
 
-- **🤖 聊天对话**: 支持GPT-4、Claude、Gemini等400+模型
-- **🖼️ 图像生成**: DALL-E兼容API
-- **🔊 文本转语音**: 多语言TTS合成
-- **👁️ 图像理解**: 视觉理解和OCR
-- **⚡ 流式传输**: 实时响应支持
-- **🔧 函数调用**: Tool Calling支持
 
 ## 🚀 快速开始
 
@@ -22,6 +16,23 @@ git clone https://github.com/3210448723/PuterAi-python_SDK.git
 cd PuterAi-python_SDK
 pip install -r requirements.txt
 ```
+
+### 测试与生产 Token 池分离
+自本版本起，Token 管理增加环境隔离：
+1. 当设置环境变量 `TEST_MODE=1` 或 `APP_ENV` 为 `test/testing/ci` 时，TokenManager 会使用 `data/token_pool.test.json` 作为测试池文件，而不会污染生产的 `data/token_pool.json`。
+2. 测试脚本 `tests/test_deadlock_fix.py` 与 `tests/test_system.py` 已自动注入 `TEST_MODE=1`，运行 pytest 不再影响线上 token。
+3. 生产模式下（未设置 TEST_MODE）如果尝试添加前缀为 `test_token_` 的 Token，会被忽略并写日志警告，防止测试残留数据。
+4. 回退顺序：请求头 Authorization > Token 池活动 Token > 环境变量 API_TOKEN。清空 `.env` 后只要池中仍有 `active + is_valid` 的 Token，系统仍能工作；若池为空或都失效，则会记录警告并返回未授权/无可用 Token。
+
+快速验证：
+```bash
+pytest -q  # 只应看到生成/写入 token_pool.test.json
+ls data/token_pool.test.json
+```
+
+生产运行请确保：
+- 未设置 TEST_MODE
+- 提前导入真实 Token 到 `data/token_pool.json` 或设置有效 `API_TOKEN`
 
 ### 2. 配置API密钥
 ```bash

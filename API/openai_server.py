@@ -28,6 +28,7 @@ import threading
 import subprocess
 import sys
 import asyncio
+from typing import Optional, Tuple
 from threading import Semaphore
 from functools import wraps
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -41,6 +42,24 @@ load_dotenv()
 # 创建Flask应用实例
 app = Flask(__name__)
 CORS(app)  # 启用跨域资源共享
+
+# ====== 路径处理：确保可以导入utils包 ======
+# 之前代码仅将 utils 目录本身加入 sys.path，会导致 Python 在该目录内部查找子模块文件，
+# 但若 utils 目录未含 __init__.py 或存在包相对导入需求，推荐把项目根目录(parent_dir)加入 sys.path。
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+utils_dir = os.path.join(parent_dir, 'utils')  # 保留变量引用（日志或调试可用）
+
+# 导入代理和Token管理器
+try:
+    from utils import get_proxy_manager, get_token_manager
+    _proxy_token_manager_available = True
+    print("✅ 代理和Token管理器导入成功")
+except ImportError as e:
+    print(f"⚠️ 无法导入代理和Token管理器: {e}")
+    _proxy_token_manager_available = False
 
 # ====== 日志配置部分 ======
 def setup_logging():
@@ -92,9 +111,17 @@ setup_logging()
 
 # ====== 常量配置部分 ======
 
-# Puter API配置
+# Puter API配置 & 代理
 PUTER_API_URL = "https://api.puter.com/drivers/call"
 PUTER_MODELS_URL = "https://puter.com/puterai/chat/models"
+try:
+    # utils 目录已被加入 sys.path
+    from proxy_config import get_puter_proxies  # type: ignore
+    _PUTER_PROXIES = get_puter_proxies()
+    app.logger.info(f"Puter 代理设置: {_PUTER_PROXIES if _PUTER_PROXIES else '未启用'}")
+except Exception as _e:  # pragma: no cover - 导入失败仅记录日志
+    _PUTER_PROXIES = None
+    app.logger.warning(f"加载代理配置失败: {_e}")
 
 # 默认请求头配置 (模拟真实浏览器请求)
 PUTER_HEADERS_TEMPLATE = {
@@ -140,6 +167,11 @@ AUDIO_CONTENT_TYPE_MAPPING = {
     "aac": "audio/aac",
     "flac": "audio/flac"
 }
+
+SUSPECT_TOKEN_PATTERNS = [
+    "test", "none", "placeholder", "empty", "your-put", "your_put", "your-puter", "demo", "example"
+]
+MIN_TOKEN_LENGTH = 20
 
 app.logger.info("常量配置加载完成")
 
@@ -257,10 +289,35 @@ def is_usage_limited_error(error_data):
     return False
 
 
+                    
+def usage_limited_response(auto_register: bool):
+    """在请求上下文中构造用量限制响应，避免模块导入阶段调用jsonify导致的应用上下文错误。
+
+    Args:
+        auto_register: 是否已经触发自动注册流程。
+    Returns:
+        (Response, int): Flask响应对象与HTTP状态码。
+    """
+    if auto_register:
+        msg = "Token用量不足，正在后台自动重新注册。请稍后重试。"
+        details = "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。"
+    else:
+        msg = "Token用量不足"
+        details = "请更换有效Token"
+    return jsonify({
+        "error": {
+            "message": msg,
+            "type": "usage_limited_error",
+            "details": details,
+            "auto_register": auto_register
+        }
+    }), 429
+
 def auto_register_token():
     """
     在后台异步执行token注册
     
+    使用增强版注册系统，支持代理IP轮换和多Token管理。
     使用全局锁机制防止同时启动多个注册进程。
     如果已有注册进程在运行，则跳过本次注册请求。
     如果检测到IP被限制注册，则禁用自动注册功能。
@@ -292,42 +349,67 @@ def auto_register_token():
                 # 获取当前脚本所在目录
                 current_dir = os.path.dirname(os.path.abspath(__file__))
                 parent_dir = os.path.dirname(current_dir)  # 上级目录
+                
+                # 优先使用增强版注册脚本
+                enhanced_register_script = os.path.join(parent_dir, 'register_enhanced.py')
                 register_script = os.path.join(parent_dir, 'register.py')
                 
+                # 选择注册脚本
+                if _proxy_token_manager_available and os.path.exists(enhanced_register_script):
+                    app.logger.info("🚀 使用增强版注册脚本（支持代理和多Token）")
+                    script_to_use = enhanced_register_script
+                    # 对于增强版脚本，尝试注册多个Token
+                    command = [sys.executable, script_to_use, '--count', '3']
+                else:
+                    app.logger.info("🚀 使用标准注册脚本")
+                    script_to_use = register_script
+                    command = [sys.executable, script_to_use]
+                
                 # 检查注册脚本是否存在
-                if not os.path.exists(register_script):
-                    app.logger.error(f"❌ 注册脚本不存在: {register_script}")
+                if not os.path.exists(script_to_use):
+                    app.logger.error(f"❌ 注册脚本不存在: {script_to_use}")
                     return
                 
                 # 在新进程中运行注册脚本
-                app.logger.info(f"🚀 正在执行注册脚本: {register_script}")
+                app.logger.info(f"🚀 正在执行注册脚本: {script_to_use}")
                 result = subprocess.run(
-                    [sys.executable, register_script],
+                    command,
                     cwd=parent_dir,
                     capture_output=True,
                     text=True,
-                    timeout=120  # 2分钟超时
+                    timeout=300  # 5分钟超时（增强版需要更多时间）
                 )
                 
                 if result.returncode == 0:
                     app.logger.info("✅ 自动注册成功完成")
-                    app.logger.info(f"注册输出: {result.stdout}")
+                    if result.stdout:
+                        app.logger.info(f"注册输出: {result.stdout}")
+                    
+                    # 如果使用Token管理器，尝试重新加载Token池
+                    if _proxy_token_manager_available:
+                        try:
+                            token_manager = get_token_manager()
+                            stats = token_manager.get_token_stats()
+                            app.logger.info(f"📊 Token池状态: {stats}")
+                        except Exception as e:
+                            app.logger.warning(f"重新加载Token池失败: {e}")
                     
                     # 重新加载环境变量
                     load_dotenv(override=True)
                     app.logger.info("🔄 已重新加载环境变量")
                 else:
                     app.logger.error(f"❌ 自动注册失败，返回码: {result.returncode}")
-                    app.logger.error(f"错误输出: {result.stderr}")
+                    if result.stderr:
+                        app.logger.error(f"错误输出: {result.stderr}")
                     
-                    # 检查是否是注册被限制（register.py返回-1）
-                    if result.returncode == 1:  # register.py中return -1会导致进程退出码为1
+                    # 检查是否是注册被限制（register.py返回1）
+                    if result.returncode == 1:
                         app.logger.warning("🚫 检测到IP被限制注册，禁用自动注册功能")
                         _auto_register_disabled = True
-                        app.logger.info("💡 提示：请更换网络环境或IP地址后手动运行register.py重新注册")
+                        app.logger.info("💡 提示：请运行初始化脚本获取代理IP后重新尝试: python init_system.py")
                     
             except subprocess.TimeoutExpired:
-                app.logger.error("❌ 自动注册超时")
+                app.logger.error("❌ 自动注册超时（5分钟）")
             except Exception as e:
                 app.logger.error(f"❌ 自动注册过程中出错: {str(e)}")
             finally:
@@ -389,38 +471,173 @@ def ensure_env_file_exists():
     return env_file
 
 
+def _is_suspect_token(token: str) -> Tuple[bool, str]:
+    """判定 token 是否疑似占位/测试，逻辑需与 token_manager._is_suspect 保持一致。"""
+    if not token:
+        return True, "空token"
+    lowered = token.lower()
+    if len(token) < MIN_TOKEN_LENGTH:
+        return True, f"长度过短({len(token)})"
+    for p in SUSPECT_TOKEN_PATTERNS:
+        if p in lowered:
+            return True, f"包含可疑片段:{p}"
+    return False, ""
+
+
 def get_effective_api_key():
+    """获取有效API密钥，按优先级：请求头 -> Token池 -> 环境变量。
+
+    对请求头中的 token 做可疑过滤：过短或包含 test/none/placeholder/your-put 等片段则忽略，
+    自动回退到 Token 池；若池不可用再回退 env。
     """
-    获取有效的API密钥
-    
-    系统支持两种API密钥配置方式：
-    1. 请求头Authorization (优先级更高): Bearer your-api-key
-    2. 环境变量API_TOKEN (回退方案)
-    
-    Returns:
-        str: 有效的API密钥
-        
-    Note:
-        请求头中的API密钥长度必须大于8字符才被认为是有效的
-    """
-    # 方式1: 从请求头获取API密钥
+    source = "none"
+    # ---------- 方式1: 请求头 ----------
     auth_header = request.headers.get('Authorization', '')
     if auth_header.startswith('Bearer '):
-        request_api_key = auth_header[7:].strip()  # 移除 'Bearer ' 前缀
-        if len(request_api_key) > 8:  # 只接受长度大于8的密钥
-            app.logger.debug("使用请求头中的API密钥")
-            return request_api_key
+        request_api_key = auth_header[7:].strip()
+        suspect, reason = _is_suspect_token(request_api_key)
+        if suspect:
+            app.logger.info(f"过滤请求头Token({request_api_key[:8]}...): {reason} -> 使用池/环境变量")
         else:
-            app.logger.debug("请求头中的API密钥长度不足，忽略")
-    
-    # 方式2: 回退到环境变量
-    env_api_key = os.getenv('API_TOKEN', '')
+            # 校验其在池中状态（如果存在池）
+            if _proxy_token_manager_available:
+                try:
+                    token_manager = get_token_manager()
+                    token_data = token_manager.token_pool.get(request_api_key)
+                    if token_data and (not token_data.get('is_valid', True) or token_data.get('status') != 'active'):
+                        app.logger.warning(f"请求头Token已失效: {request_api_key[:8]}..., 尝试切换")
+                        token_manager.remove_token(request_api_key)
+                        alt = token_manager.get_current_token()
+                        if alt:
+                            app.logger.info(f"改用池Token: {alt[:8]}... (请求头失效)")
+                            return alt
+                        else:
+                            app.logger.error("没有可用Token (请求头失效且池为空)")
+                            return ''
+                except Exception as e:
+                    app.logger.error(f"验证请求头Token时出错: {e}")
+            app.logger.debug("使用请求头中的API密钥")
+            source = "header"
+            return request_api_key
+    # ---------- 方式2: Token池 ----------
+    if _proxy_token_manager_available:
+        try:
+            token_manager = get_token_manager()
+            current_token = token_manager.get_current_token()
+            if current_token:
+                app.logger.debug(f"使用Token池Token: {current_token[:8]}...")
+                source = "pool"
+                return current_token
+        except Exception as e:
+            app.logger.warning(f"从Token管理器获取密钥失败: {e}")
+    # ---------- 方式3: 环境变量 ----------
+    env_api_key = os.getenv('API_TOKEN', '').strip()
     if env_api_key:
-        app.logger.debug("使用环境变量中的API密钥")
-        return env_api_key
-    
-    app.logger.warning("未找到有效的API密钥")
+        suspect, reason = _is_suspect_token(env_api_key)
+        if suspect:
+            app.logger.warning(f"环境变量Token看似无效({env_api_key[:8]}...): {reason}")
+        else:
+            if _proxy_token_manager_available:
+                try:
+                    token_manager = get_token_manager()
+                    token_data = token_manager.token_pool.get(env_api_key)
+                    if token_data and (not token_data.get('is_valid', True) or token_data.get('status') != 'active'):
+                        app.logger.warning(f"环境变量Token已失效: {env_api_key[:8]}..., 删除并尝试切换")
+                        token_manager.remove_token(env_api_key)
+                        alt = token_manager.get_current_token()
+                        if alt:
+                            app.logger.info(f"改用池Token: {alt[:8]}... (环境变量失效)")
+                            return alt
+                        else:
+                            return ''
+                except Exception as e:
+                    app.logger.error(f"检查环境变量Token时出错: {e}")
+            app.logger.debug("使用环境变量中的API密钥")
+            source = "env"
+            return env_api_key
+    app.logger.warning("未找到有效的API密钥 (source=%s)", source)
     return ''
+
+
+def handle_token_invalid(token: str, error_info: Optional[str] = None):
+    """
+    处理Token无效的情况
+    
+    Args:
+        token: 无效的Token
+        error_info: 错误信息
+    """
+    if _proxy_token_manager_available:
+        try:
+            token_manager = get_token_manager()
+            
+            # 根据错误类型标记并直接移除该token
+            if token in token_manager.token_pool:
+                if 'usage-limited' in str(error_info):
+                    token_manager.mark_token_exhausted(token)
+                else:
+                    token_manager.mark_token_invalid(token, error_info)
+                # 移除该token
+                token_manager.remove_token(token)
+                app.logger.warning(f"已移除无效Token: {token[:8]}... ({error_info})")
+
+            # 尝试获取当前可用token
+            alt = token_manager.get_current_token()
+            if alt:
+                app.logger.info(f"切换到备用Token: {alt[:8]}...")
+                return True
+            app.logger.error("所有Token均不可用")
+            return False
+                
+        except Exception as e:
+            app.logger.error(f"处理Token无效时出错: {e}")
+    
+    return False
+
+
+def handle_token_error_and_rotate(error_type: str, api_key: str, error_payload: Optional[dict] = None, context: str = ""):
+    """统一处理与当前 token 相关的各种错误并尝试轮换下一个 token。
+
+    Args:
+        error_type: 错误类型标识，如 'usage_limited', 'token_auth_failed', 'invalid', 'exhausted'
+        api_key: 当前请求使用的 token
+        error_payload: 上游返回的完整错误数据（可选）
+        context: 触发场景描述，方便日志排查
+    Returns:
+        dict: { 'rotated': bool, 'next_token': Optional[str] }
+    """
+    result = {"rotated": False, "next_token": None}
+    if not api_key:
+        return result
+
+    if not _proxy_token_manager_available:
+        app.logger.warning("Token管理器不可用，无法执行统一轮换处理")
+        return result
+
+    try:
+        token_manager = get_token_manager()
+        if api_key in token_manager.token_pool:
+            mark_reason = error_type
+            if error_type == 'usage_limited' or 'usage-limited' in error_type:
+                token_manager.mark_token_exhausted(api_key)
+            elif error_type == 'token_auth_failed':
+                token_manager.mark_token_invalid(api_key, 'token_auth_failed')
+            elif error_type == 'invalid':
+                token_manager.mark_token_invalid(api_key, 'invalid')
+            else:
+                token_manager.mark_token_invalid(api_key, mark_reason)
+
+        app.logger.warning(f"🔄 触发Token轮换 ({error_type})，当前池Token: {api_key[:8]}... 场景: {context}")
+        next_token = token_manager.switch_to_next_token()
+        if next_token:
+            result['rotated'] = True
+            result['next_token'] = next_token
+            app.logger.info(f"➡️ 已切换到下一个Token: {next_token[:8]}...")
+        else:
+            app.logger.error("没有可用的后续Token可供切换")
+    except Exception as e:
+        app.logger.error(f"统一Token处理异常: {e}")
+    return result
 
 
 def get_puter_headers(api_key=None):
@@ -599,6 +816,26 @@ def openai_stream_chunk(data_obj: dict) -> str:
 app.logger.info("工具函数初始化完成")
 
 
+def _filter_models(models):
+    """对模型列表进行简单过滤/去重：
+    1. 去重保持顺序
+    2. 排除空字符串或明显占位项(长度<3)
+    3. 预留扩展（可加入黑名单）
+    """
+    seen = set()
+    result = []
+    for m in models:
+        if not m or not isinstance(m, str):
+            continue
+        if len(m.strip()) < 3:
+            continue
+        if m in seen:
+            continue
+        seen.add(m)
+        result.append(m)
+    return result
+
+
 # ====== API端点实现部分 ======
 
 @app.route("/v1/models", methods=["GET"])
@@ -609,7 +846,8 @@ def list_models():
     
     首先尝试从Puter API动态获取最新模型列表，
     如果失败则使用内置的静态模型列表作为回退。
-    todo: 可能包含不可用的模型，如：claude-3-haiku-20240307、arcee_ai/arcee-spotlight、meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo等，建议选择热门模型使用
+    NOTE: 静态回退列表可能包含上游已下线或不可访问模型（例如 claude-3-haiku-20240307、arcee_ai/arcee-spotlight 等），
+    实际调用前建议先做一次试探请求或根据使用频率定期裁剪。可以在后续版本加入健康缓存。 
     
     Returns:
         JSON: OpenAI格式的模型列表响应
@@ -634,14 +872,13 @@ def list_models():
     # 尝试从Puter API动态获取模型列表
     try:
         app.logger.debug("正在从Puter API获取模型列表...")
-        response = requests.get(PUTER_MODELS_URL, headers=headers, timeout=30)
+        response = requests.get(PUTER_MODELS_URL, headers=headers, timeout=30, proxies=_PUTER_PROXIES)
         if response.status_code == 200:
             models_data = response.json()
             for model in models_data.get("models", []):
-                # 如果是字典类型对象，核对是否符合openai模型格式
                 if isinstance(model, dict):
                     data.append({
-                        "id": model["id"] if "id" in model else model.get("name", ""),
+                        "id": model.get("id") or model.get("name", ""),
                         "object": "model",
                         "created": now,
                         "owned_by": "puter",
@@ -656,18 +893,19 @@ def list_models():
             app.logger.info(f"成功从Puter API获取到 {len(data)} 个模型")
             return jsonify({"object": "list", "data": data})
     except Exception as e:
-        app.logger.error(f"从Puter API获取模型列表失败: {str(e)}")
+        app.logger.error(f"从Puter API获取模型列表失败: {e}")
 
     # 回退到静态模型列表
     app.logger.warning("使用静态模型列表作为回退")
-    for model_name in PUTER_MODELS_FALLBACK:
+    filtered = _filter_models(PUTER_MODELS_FALLBACK)
+    for model_name in filtered:
         data.append({
             "id": model_name,
             "object": "model",
             "created": now,
             "owned_by": "puter",
         })
-    app.logger.info(f"返回 {len(data)} 个静态模型")
+    app.logger.info(f"返回 {len(data)} 个静态模型(过滤后原始={len(PUTER_MODELS_FALLBACK)})")
     return jsonify({"object": "list", "data": data})
 
 
@@ -819,11 +1057,11 @@ def chat_completions():
 
             try:
                 app.logger.debug("Sending streaming request to Puter API")
-                with requests.post(PUTER_API_URL, headers=headers, json=payload_stream, stream=True, timeout=30) as r:
+                with requests.post(PUTER_API_URL, headers=headers, json=payload_stream, stream=True, timeout=30, proxies=_PUTER_PROXIES) as r:
                     if r.status_code != 200:
                         app.logger.warning(f"Stream request failed with status {r.status_code}, falling back to non-stream")
                         # Fallback: non-stream request
-                        non_stream_resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120)
+                        non_stream_resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120, proxies=_PUTER_PROXIES)
                         text_out = ""
                         if non_stream_resp.ok:
                             data_json = non_stream_resp.json()
@@ -966,14 +1204,49 @@ def chat_completions():
     app.logger.info("Processing non-streaming request")
     try:
         app.logger.debug("Sending request to Puter API")
-        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120)
+        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120, proxies=_PUTER_PROXIES)
     except Exception as e:
         app.logger.error(f"Upstream request failed: {str(e)}")
         return jsonify({"error": {"message": f"Upstream error: {str(e)}"}}), 502
 
+    # 预取响应文本，便于多次使用
+    try:
+        resp_text = resp.text  # requests 会缓存，后续 resp.json() 仍可用
+    except Exception:
+        resp_text = ""
+
+    # 精确检测 token 鉴权失败：必须满足 HTTP 401/403 或 JSON error 中出现特定字段
+    token_auth_failed = False
+    json_error_block = None
+    if resp.status_code in (401, 403):
+        token_auth_failed = True
+    else:
+        # 尝试解析 JSON 进一步判断
+        try:
+            _tmp_json = resp.json()
+            json_error_block = _tmp_json.get('error') if isinstance(_tmp_json, dict) else None
+            if json_error_block and 'token_auth_failed' in json.dumps(json_error_block):
+                token_auth_failed = True
+        except Exception:
+            # 非 JSON 或解析失败忽略
+            pass
+    if token_auth_failed:
+        rotate_res = handle_token_error_and_rotate('token_auth_failed', api_key, context='chat_completions_non_stream')
+        next_tok = rotate_res.get('next_token')
+        hint = (next_tok[:8] + '...') if isinstance(next_tok, str) and next_tok else None
+        return jsonify({
+            "error": {
+                "message": "token_auth_failed: 当前Token无效(或未授权)并已尝试切换，请重试",
+                "type": "authentication_error",
+                "rotated": rotate_res.get('rotated'),
+                "next_token_hint": hint,
+                "status_code": resp.status_code
+            }
+        }), 401
+
     if not resp.ok:
-        app.logger.error(f"Upstream returned status {resp.status_code}: {resp.text}")
-        return jsonify({"error": {"message": f"Upstream status {resp.status_code}", "details": resp.text}}), 502
+        app.logger.error(f"Upstream returned status {resp.status_code}: {resp_text}")
+        return jsonify({"error": {"message": f"Upstream status {resp.status_code}", "details": resp_text}}), 502
 
     data = resp.json()
     if not data.get("success"):
@@ -981,17 +1254,19 @@ def chat_completions():
         
         # 检测是否是token用量不足错误，如果是则自动重新注册
         if is_usage_limited_error(data):
-            app.logger.warning("🚨 检测到token用量不足错误，正在自动重新注册...")
-            auto_register_token()
-            
-            return jsonify({
-                "error": {
-                    "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
-                    "type": "usage_limited_error",
-                    "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
-                    "auto_register": True
-                }
-            }), 429  # 使用429状态码表示速率限制
+            app.logger.warning("🚨 检测到token用量不足错误，执行统一处理与自动注册...")
+            handle_token_error_and_rotate('usage_limited', api_key, data, context='chat_completions_non_stream')
+            try:
+                from utils.config_manager import get_config_manager
+                if get_config_manager().get('system.auto_register_enabled'):
+                    auto_register_token()
+                else:
+                    app.logger.info('自动注册已禁用(配置)，跳过自动注册流程')
+                    return usage_limited_response(False)
+            except Exception as _e:
+                app.logger.warning(f'读取自动注册配置失败: {_e}')
+                return usage_limited_response(False)
+            return usage_limited_response(True)
         
         return jsonify({"error": {"message": "Upstream返回错误", "details": data}}), 502
 
@@ -1112,7 +1387,7 @@ def image_generation():
 
     try:
         app.logger.debug("向Puter API发送图像生成请求")
-        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120)
+        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120, proxies=_PUTER_PROXIES)
     except Exception as e:
         app.logger.error(f"图像生成请求失败: {str(e)}")
         return jsonify({"error": {"message": f"上游服务错误: {str(e)}"}}), 502
@@ -1131,16 +1406,24 @@ def image_generation():
                 # 检测是否是token用量不足错误，如果是则自动重新注册
                 if is_usage_limited_error(data):
                     app.logger.warning("🚨 图像生成检测到token用量不足错误，正在自动重新注册...")
-                    auto_register_token()
                     
-                    return jsonify({
-                        "error": {
-                            "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
-                            "type": "usage_limited_error",
-                            "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
-                            "auto_register": True
-                        }
-                    }), 429
+                    # 标记当前Token为无效或用量耗尽
+                    current_token = api_key
+                    if current_token:
+                        handle_token_invalid(current_token, str(data.get('error', {})))
+
+                    try:
+                        from utils.config_manager import get_config_manager
+                        if get_config_manager().get('system.auto_register_enabled'):
+                            auto_register_token()
+                        else:
+                            app.logger.info('自动注册已禁用(配置)，跳过自动注册流程')
+                            return usage_limited_response(False)
+                    except Exception as _e:
+                        app.logger.warning(f'读取自动注册配置失败: {_e}')
+                        return usage_limited_response(False)
+                    
+                    return usage_limited_response(True)
                 
                 return jsonify({"error": {"message": "图像生成失败", "details": data}}), 502
             
@@ -1255,7 +1538,7 @@ def text_to_speech():
 
     try:
         app.logger.debug("向Puter API发送TTS请求")
-        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120)
+        resp = requests.post(PUTER_API_URL, headers=headers, json=payload, timeout=120, proxies=_PUTER_PROXIES)
     except Exception as e:
         app.logger.error(f"TTS请求失败: {str(e)}")
         return jsonify({"error": {"message": f"上游服务错误: {str(e)}"}}), 502
@@ -1269,16 +1552,24 @@ def text_to_speech():
                 error_data = resp.json()
                 if is_usage_limited_error(error_data):
                     app.logger.warning("🚨 TTS检测到token用量不足错误，正在自动重新注册...")
-                    auto_register_token()
                     
-                    return jsonify({
-                        "error": {
-                            "message": "Token用量不足，正在后台自动重新注册。请稍后重试。",
-                            "type": "usage_limited_error",
-                            "details": "系统已自动启动token更新流程，请等待1-2分钟后重新发送请求。",
-                            "auto_register": True
-                        }
-                    }), 429
+                    # 标记当前Token为无效或用量耗尽
+                    current_token = api_key
+                    if current_token:
+                        handle_token_invalid(current_token, str(error_data.get('error', {})))
+                    
+                    try:
+                        from utils.config_manager import get_config_manager
+                        if get_config_manager().get('system.auto_register_enabled'):
+                            auto_register_token()
+                        else:
+                            app.logger.info('自动注册已禁用(配置)，跳过自动注册流程')
+                            return usage_limited_response(False)
+                    except Exception as _e:
+                        app.logger.warning(f'读取自动注册配置失败: {_e}')
+                        return usage_limited_response(False)
+                
+                    return usage_limited_response(True)
         except:
             pass  # 如果解析失败，继续使用原有错误处理
         
@@ -1359,17 +1650,6 @@ def enable_auto_register_endpoint():
     Returns:
         JSON: 操作结果
     """
-    # 验证API密钥
-    api_key = get_effective_api_key()
-    if not api_key:
-        app.logger.error("未提供有效的API密钥")
-        return jsonify({
-            "error": {
-                "message": "未提供有效的API密钥。请在Authorization头中提供或设置API_TOKEN环境变量",
-                "type": "invalid_request_error"
-            }
-        }), 401
-    
     enable_auto_register()
     
     return jsonify({
@@ -1387,18 +1667,7 @@ def auto_register_status():
     
     Returns:
         JSON: 自动注册功能的状态信息
-    """
-    # 验证API密钥
-    api_key = get_effective_api_key()
-    if not api_key:
-        app.logger.error("未提供有效的API密钥")
-        return jsonify({
-            "error": {
-                "message": "未提供有效的API密钥。请在Authorization头中提供或设置API_TOKEN环境变量",
-                "type": "invalid_request_error"
-            }
-        }), 401
-    
+    """    
     return jsonify({
         "auto_register_disabled": is_auto_register_disabled(),
         "auto_register_in_progress": _auto_register_in_progress,
@@ -1406,6 +1675,45 @@ def auto_register_status():
         "timestamp": int(time.time())
     })
 
+
+# 手动触发重新加载本地的配置文件
+@app.route("/v1/admin/reload-config", methods=["GET"])
+@limit_concurrency()
+def reload_config_endpoint():
+    """
+    重新加载本地配置文件的管理端点
+    
+    Returns:
+        JSON: 操作结果
+    """
+    global _PUTER_PROXIES
+    app.logger.info("收到重新加载配置文件请求")
+    try:
+        from utils.config_manager import get_config_manager
+        config_manager = get_config_manager()
+        config_manager.load_config()  # 重新加载配置文件
+
+        from utils.token_manager import get_token_manager
+        token_manager = get_token_manager()
+        token_manager.load_token_pool()  # 重新加载Token池
+
+        if _PUTER_PROXIES:
+            _PUTER_PROXIES = get_puter_proxies()
+        else:
+            app.logger.info("当前未配置代理，无需重新加载代理设置")
+        app.logger.info("本地配置文件重新加载成功")
+        return jsonify({
+            "message": "本地配置文件重新加载成功",
+            "timestamp": int(time.time())
+        })
+    except Exception as e:
+        app.logger.error(f"重新加载配置文件失败: {str(e)}")
+        return jsonify({
+            "error": {
+                "message": f"重新加载配置文件失败: {str(e)}",
+                "type": "internal_error"
+            }
+        }), 500
 
 # ====== 服务器启动部分 ======
 

@@ -8,7 +8,10 @@
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), 'API'))
+# 将项目根目录加入 sys.path 以便导入 API 包
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from API.openai_server import is_usage_limited_error, auto_register_token, ensure_env_file_exists
 

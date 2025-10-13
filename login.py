@@ -1,6 +1,19 @@
 import requests
 import json
 
+def _load_proxies():
+    try:
+        from utils.proxy_config import get_puter_proxies  # 包模式
+        return get_puter_proxies()
+    except Exception:
+        try:
+            from proxy_config import get_puter_proxies  # 脚本模式
+            return get_puter_proxies()
+        except Exception:
+            return None
+
+_PUTER_PROXIES = _load_proxies()
+
 def mowhn():
     username = input("Enter your username: ")
     password = input("Enter your password: ")
@@ -22,8 +35,7 @@ def mowhn():
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload)
-
+        response = requests.post(url, headers=headers, json=payload, proxies=_PUTER_PROXIES, timeout=30)
         if response.status_code == 200:
             data = response.json()
             if data.get("proceed"):

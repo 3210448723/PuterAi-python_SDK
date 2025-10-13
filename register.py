@@ -1,10 +1,13 @@
 # 用浏览器访问 https://puter.com/ 会自动生成一个 token：其中有一个请求 https://puter.com/signup 会自动创建一个临时账户，获取其返回值字典中的token字段即可，将其写入.env文件中API_TOKEN="your_token"
 import asyncio
 from playwright.async_api import async_playwright
+import os
 
 async def get_signup_token():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # 统一代理: 所有访问 puter.com 的浏览器流量走 127.0.0.1:10809
+        proxy_addr = os.getenv("PUTER_PROXY", "http://127.0.0.1:10809")
+        browser = await p.chromium.launch(headless=True, proxy={"server": proxy_addr})
         # 创建全新环境，添加更真实的浏览器设置
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
