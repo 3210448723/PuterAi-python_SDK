@@ -431,7 +431,7 @@ class TokenManager:
         invalid_tokens = []
         
         for token in list(self.token_pool.keys()):
-            if not self.verify_token(token):
+            if not self.verify_token(self.token_pool[token]['token']):
                 invalid_tokens.append(token)
         
         self.logger.info(f"Token验证完成，发现 {len(invalid_tokens)} 个无效Token")

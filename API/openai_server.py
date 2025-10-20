@@ -627,7 +627,7 @@ def handle_token_error_and_rotate(error_type: str, api_key: str, error_payload: 
             else:
                 token_manager.mark_token_invalid(api_key, mark_reason)
 
-        app.logger.warning(f"🔄 触发Token轮换 ({error_type})，当前池Token: {api_key[:8]}... 场景: {context}")
+        app.logger.warning(f"🔄 触发Token轮换 ({error_type})，当前池Token: {api_key[:8]}...{api_key[-8:]} 场景: {context}")
         next_token = token_manager.switch_to_next_token()
         if next_token:
             result['rotated'] = True
