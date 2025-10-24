@@ -61,6 +61,9 @@ except ImportError as e:
     print(f"⚠️ 无法导入代理和Token管理器: {e}")
     _proxy_token_manager_available = False
 
+# 导入参数验证工具
+from utils.validate_params import validate_messages
+
 # ====== 日志配置部分 ======
 def setup_logging():
     """
@@ -84,7 +87,7 @@ def setup_logging():
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s [%(levelname)s] [%(filename)s:%(funcName)s:%(lineno)d] %(message)s'
     ))
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
 
     # 配置控制台日志处理器
     console_handler = logging.StreamHandler()
@@ -99,7 +102,7 @@ def setup_logging():
     # 将处理器添加到应用日志器
     app.logger.addHandler(file_handler)
     app.logger.addHandler(console_handler)
-    app.logger.setLevel(logging.INFO)
+    app.logger.setLevel(logging.DEBUG)
 
     # 降低Flask内置日志级别，减少噪音
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
@@ -127,8 +130,8 @@ except Exception as _e:  # pragma: no cover - 导入失败仅记录日志
 PUTER_HEADERS_TEMPLATE = {
     'Accept': '*/*',
     'Content-Type': 'application/json;charset=UTF-8',
-    'Origin': 'https://docs.puter.com',
-    'Referer': 'https://docs.puter.com/',
+    'Origin': 'https://docs.puter.com',  # 必备
+    'Referer': 'https://docs.puter.com/',  # 必备
     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 }
 
@@ -282,8 +285,7 @@ def is_usage_limited_error(error_data):
         # 检测特定的用量限制错误
         if (delegate == 'usage-limited-chat' or 
             'usage-limited' in delegate or
-            'Permission denied' in message or
-            code == 'error_400_from_delegate'):
+            'Permission denied' in message):
             return True
     
     return False
@@ -961,6 +963,18 @@ def chat_completions():
         app.logger.warning("请求中未提供消息内容")
         return jsonify({"error": {"message": "messages字段是必需的"}}), 400
 
+    is_valid, errors, suggestions = validate_messages(messages)
+    if not is_valid:
+        app.logger.error(f"消息验证失败: {errors}，建议: {suggestions}")
+        return jsonify({
+            "error": {
+                "message": "消息格式验证失败",
+                "details": errors,
+                "suggestions": suggestions
+            }
+        }), 400
+    app.logger.debug("消息格式验证通过")
+
     # 检测是否包含图像内容 (Vision API功能)
     has_vision = False
     for message in messages:
@@ -1251,6 +1265,7 @@ def chat_completions():
     data = resp.json()
     if not data.get("success"):
         app.logger.error(f"Upstream returned error: {data}")
+        app.logger.info(f'payload:\n{str(payload)}')
         
         # 检测是否是token用量不足错误，如果是则自动重新注册
         if is_usage_limited_error(data):

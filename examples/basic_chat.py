@@ -27,8 +27,17 @@ def main():
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "user", "content": "你好！请简单介绍一下自己。"}
-            ]
+                {"role": "system", "content": "你是一个知识渊博的助手。"},
+                {"role": "user", "content": [{
+				"type": "text",
+				"text": "3"
+			}, {
+				"type": "text",
+				"text": "1"
+			}]},
+                {"role": "user", "content": "请复述我刚才说的话。"},
+            ],
+            max_tokens=100
         )
         
         print("🤖 AI回复:")
@@ -42,9 +51,13 @@ def main():
         stream = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "user", "content": "请用一段话描述人工智能的发展前景"}
+                {"role": "system", "content": "你是一个知识渊博的助手。"},
+                {"role": "user", "content": "456"},
+                {"role": "user", "content": "123"},
+                {"role": "user", "content": "请复述我刚才说的话。"},
             ],
-            stream=True
+            stream=True,
+            max_tokens=100
         )
         
         for chunk in stream:
@@ -79,6 +92,13 @@ def main():
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
+                {"role": "user", "content": [{
+				"type": "text",
+				"text": "1"
+			}, {
+				"type": "text",
+				"text": "2"
+			}]},
                 {"role": "user", "content": "北京今天天气怎么样？"}
             ],
             tools=tools

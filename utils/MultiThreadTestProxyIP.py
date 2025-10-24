@@ -15,16 +15,6 @@ from lxml import etree
 
 from .check_proxy_ip import check_proxy_ip
 
-# 获取当前文件名
-filename = os.path.basename(__file__)
-# 获取当前时间并格式化
-current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-# 创建日志文件名
-log_filename = f"{filename}_{current_time}.log"
-
-# 设置日志记录器
-logging.basicConfig(filename=log_filename, level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s', encoding='utf-8')
 ip_port_dict = {}
 
 headers = {

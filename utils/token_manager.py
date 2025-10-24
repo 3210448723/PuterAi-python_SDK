@@ -62,6 +62,7 @@ class TokenManager:
             self.token_file = base_pool_file
         self.max_tokens = max_tokens or token_config['max_tokens']
         self.token_pool: Dict[str, Dict] = {}
+        self.tokens: list = []
         self.current_token_index = 0
         self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
@@ -83,8 +84,7 @@ class TokenManager:
     def _valid_tokens_locked(self):
         """在已持有 self.lock 的情况下返回当前有效 token 列表 (实际token字符串)。"""
         return [
-            self.token_pool[token_id]['token'] for token_id, data in self.token_pool.items()
-            if data.get('is_valid', True) and data.get('status') == 'active'
+            token for token in self.token_pool.keys() if self.check_token(token)
         ]
 
     # ---------------- 辅助: 可疑token判定 -----------------
@@ -119,6 +119,8 @@ class TokenManager:
                     self.token_pool = data.get('tokens', {})
                     self.current_token_index = data.get('current_index', 0)
                 self.logger.info(f"[{self._mode_tag()}] 已加载 {len(self.token_pool)} 个Token (文件: {self.token_file})")
+
+                self.tokens = self.load_tokens_only()
             else:
                 self.logger.info("Token池文件不存在，将创建新的Token池")
                 # 确保目录存在
@@ -153,12 +155,16 @@ class TokenManager:
         elif main_token:
             self.logger.warning("环境变量API_TOKEN看似为占位/测试，已忽略")
     
+    def load_tokens_only(self) -> list:
+        """仅加载Token列表（实际token字符串）"""
+        return [token for token in self.token_pool]
+
     def add_token(self, token: str, is_primary: bool = False, proxy_info: Optional[Dict] = None) -> None:
         """
         添加Token到池中
         
         Args:
-            token: API Token名称，不一定等于实际使用的Token，self.token_pool[token]['token']才是实际值
+            token: API todo: Token名称，等于实际使用的Token，self.token_pool[token]['token']也是实际值
             is_primary: 是否为主Token
             proxy_info: 获取此Token时使用的代理信息
         """
@@ -169,7 +175,7 @@ class TokenManager:
 
         with self.lock:
             # 避免重复添加（使用内部存储的完整token键值比对）
-            if token in self.token_pool:
+            if token in self.tokens:
                 self.logger.warning(f"Token已存在: {token[:8]}...")
                 return
             
@@ -202,7 +208,7 @@ class TokenManager:
             token: 要移除的Token
         """
         with self.lock:
-            if token in self.token_pool:
+            if token in self.tokens:
                 del self.token_pool[token]
                 self.logger.warning(f"移除无效Token: {token[:8]}...")
                 self.save_token_pool()
@@ -219,7 +225,7 @@ class TokenManager:
             error_info: 错误信息
         """
         with self.lock:
-            if token in self.token_pool:
+            if token in self.tokens:
                 token_data = self.token_pool[token]
                 token_data['is_valid'] = False
                 token_data['status'] = 'invalid'
@@ -228,6 +234,7 @@ class TokenManager:
                     'time': datetime.now().isoformat(),
                     'info': error_info
                 }
+                self.token_pool[token] = token_data
                 
                 self.logger.warning(f"标记Token无效: {token[:8]}... - {error_info}")
                 self.save_token_pool()
@@ -242,10 +249,11 @@ class TokenManager:
             token: Token
         """
         with self.lock:
-            if token in self.token_pool:
+            if token in self.tokens:
                 token_data = self.token_pool[token]
                 token_data['status'] = 'exhausted'
                 token_data['exhausted_time'] = datetime.now().isoformat()
+                self.token_pool[token] = token_data
                 
                 self.logger.warning(f"标记Token用量耗尽: {token[:8]}...")
                 self.save_token_pool()
@@ -261,7 +269,7 @@ class TokenManager:
         should_mark_invalid = False
         
         with self.lock:
-            if token in self.token_pool:
+            if token in self.tokens:
                 token_data = self.token_pool[token]
                 token_data['last_used'] = datetime.now().isoformat()
                 token_data['usage_count'] += 1
@@ -272,6 +280,7 @@ class TokenManager:
                     if token_data['error_count'] >= 5:
                         should_mark_invalid = True
                 
+                self.token_pool[token] = token_data
                 self.save_token_pool()
         
         # 在锁外处理Token失效，避免死锁
@@ -396,22 +405,22 @@ class TokenManager:
             
             # 更新验证时间（在锁内进行）
             with self.lock:
-                if token in self.token_pool:
+                if token in self.tokens:
                     self.token_pool[token]['last_verified'] = datetime.now().isoformat()
             
             if response.status_code == 200:
                 data = response.json()
                 if data.get('success'):
-                    self.logger.info(f"Token验证成功: {token[:8]}...")
+                    self.logger.info(f"Token验证成功: {token[:8]}...{token[-8:]}")
                     return True
                 else:
                     error_info = data.get('error', {})
                     if 'usage-limited' in str(error_info):
-                        self.logger.warning(f"Token用量耗尽: {token[:8]}...")
+                        self.logger.warning(f"Token用量耗尽: {token[:8]}...{token[-8:]}")
                         # 在锁外调用，避免死锁
                         self.mark_token_exhausted(token)
                     else:
-                        self.logger.warning(f"Token验证失败: {token[:8]}... - {error_info}")
+                        self.logger.warning(f"Token验证失败: {token[:8]}...{token[-8:]} - {error_info}")
                         # 在锁外调用，避免死锁
                         self.mark_token_invalid(token, str(error_info))
                     return False
@@ -464,8 +473,8 @@ class TokenManager:
         """清理无效Token"""
         with self.lock:
             invalid_tokens = [
-                token for token, data in self.token_pool.items()
-                if not data.get('is_valid', True) or data.get('status') == 'invalid'
+                token for token in self.tokens
+                if self.check_token(token) is False
             ]
             
             for token in invalid_tokens:
@@ -485,16 +494,32 @@ class TokenManager:
         Returns:
             bool: 是否有足够的Token
         """
-        active_count = len([
-            t for t in self.token_pool.values() 
-            if t.get('status') == 'active' and t.get('is_valid', True)
-        ])
+        with self.lock:
+            active_count = len(self._valid_tokens_locked())
+            
+            if active_count < min_count:
+                self.logger.warning(f"可用Token不足 ({active_count}/{min_count})")
+                return False
+            
+            return True
+
+    def check_token(self, token: str) -> bool:
+        """
+        检查指定Token是否有效
         
-        if active_count < min_count:
-            self.logger.warning(f"可用Token不足 ({active_count}/{min_count})")
+        Args:
+            token: 要检查的Token
+            
+        Returns:
+            bool: Token是否有效
+        """
+        if token in self.tokens:
+            token_data = self.token_pool[token]
+            is_valid = token_data.get('is_valid', True) and token_data.get('status') == 'active'
+            return is_valid
+        else:
+            self.logger.warning(f"检查Token失败，Token不存在: {token[:8]}...")
             return False
-        
-        return True
 
 
 # 全局Token管理器实例
